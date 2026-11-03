@@ -38,11 +38,12 @@ CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 TOP_K = 5
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.8-flash"
 
+# Backup models in case the primary model is temporarily unavailable.
 FALLBACK_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash"
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite"
 ]
 
 

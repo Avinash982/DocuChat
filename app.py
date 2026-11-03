@@ -1,162 +1,549 @@
-"""
-Chat with your PDF: a beginner-friendly RAG (Retrieval-Augmented Generation) app.
 
-How it works:
-  1. Read the PDF and split the text into small overlapping chunks.
-  2. Store the chunks in a vector database (ChromaDB), which turns each chunk
-     into an "embedding" so we can search by meaning, not just keywords.
-  3. When you ask a question, find the chunks most similar to it.
-  4. Send those chunks plus your question to Gemini and ask it to answer
-     using ONLY that context, citing page numbers.
+"""
+DocuChat - Chat with your PDF
+RAG (Retrieval-Augmented Generation)
+
+Workflow:
+1. Extract text from PDF.
+2. Split text into overlapping chunks.
+3. Generate embeddings and store them in ChromaDB.
+4. Retrieve relevant chunks for a question.
+5. Send context to Gemini.
+6. Generate answers with page citations.
 """
 
+import os
 import time
 import uuid
 
 import chromadb
 import streamlit as st
+
 from google import genai
 from google.genai import errors, types
 from pypdf import PdfReader
 
-# ---------- Settings you can experiment with ----------
-CHUNK_SIZE = 1200     # characters per chunk
-CHUNK_OVERLAP = 150   # characters shared between neighbouring chunks
-TOP_K = 10            # how many chunks to retrieve per question
-# Free Gemini model. If you get a "model not found" error, try
-# "gemini-2.5-flash-lite" or check the current names at aistudio.google.com
-MODEL = "gemini-3.8-flash"
-# Tried in order if the main model is overloaded or unavailable.
-FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest"]
+
+# =====================================================
+# 1. CONFIGURATION
+# =====================================================
+
+st.set_page_config(
+    page_title="DocuChat - AI PDF Assistant",
+    page_icon="📄",
+    layout="wide"
+)
+
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+TOP_K = 5
+
+MODEL = "gemini-2.5-flash"
+
+FALLBACK_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash"
+]
 
 
-# ---------- Step 1: read and chunk the PDF ----------
+# =====================================================
+# 2. GEMINI API CONFIGURATION
+# =====================================================
+
+def get_api_key():
+
+    # First check Streamlit Cloud Secrets
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+
+    except Exception:
+        api_key = None
+
+    # If not found, check local environment variable
+    if not api_key:
+        api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "Gemini API key is missing. "
+            "Configure GEMINI_API_KEY in Streamlit Secrets "
+            "or your local environment."
+        )
+
+    return api_key
+
+
+def get_gemini_client():
+
+    api_key = get_api_key()
+
+    return genai.Client(api_key=api_key)
+
+
+# =====================================================
+# 3. PDF TEXT EXTRACTION
+# =====================================================
+
 def extract_pages(pdf_file):
-    """Return a list of (page_number, text) for every page in the PDF."""
+
     reader = PdfReader(pdf_file)
+
     pages = []
-    for i, page in enumerate(reader.pages, start=1):
+
+    for page_number, page in enumerate(reader.pages, start=1):
+
         text = page.extract_text() or ""
+
         if text.strip():
-            pages.append((i, text))
+
+            pages.append((page_number, text))
+
     return pages
 
 
-def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into overlapping pieces so ideas aren't cut off mid-way."""
+# =====================================================
+# 4. TEXT CHUNKING
+# =====================================================
+
+def chunk_text(
+    text,
+    size=CHUNK_SIZE,
+    overlap=CHUNK_OVERLAP
+):
+
     chunks = []
+
     start = 0
+
     while start < len(text):
-        chunks.append(text[start:start + size])
+
+        chunk = text[start:start + size]
+
+        chunks.append(chunk)
+
         start += size - overlap
+
     return chunks
 
 
-# ---------- Step 2: store chunks in a vector database ----------
+# =====================================================
+# 5. VECTOR DATABASE
+# =====================================================
+
 def build_index(pdf_file):
-    """Chunk the PDF and put every chunk into a fresh ChromaDB collection."""
-    client = chromadb.Client()  # in-memory, nothing saved to disk
-    collection = client.create_collection(name=f"doc_{uuid.uuid4().hex[:8]}")
 
-    ids, docs, metas = [], [], []
-    for page_num, text in extract_pages(pdf_file):
-        for j, chunk in enumerate(chunk_text(text)):
-            ids.append(f"p{page_num}_c{j}")
-            docs.append(chunk)
-            metas.append({"page": page_num})
+    client = chromadb.Client()
 
-    if not docs:
+    collection = client.create_collection(
+        name=f"doc_{uuid.uuid4().hex[:8]}"
+    )
+
+    ids = []
+    documents = []
+    metadata = []
+
+    pages = extract_pages(pdf_file)
+
+    for page_number, text in pages:
+
+        chunks = chunk_text(text)
+
+        for chunk_number, chunk in enumerate(chunks):
+
+            ids.append(
+                f"p{page_number}_c{chunk_number}"
+            )
+
+            documents.append(chunk)
+
+            metadata.append({
+                "page": page_number
+            })
+
+    if not documents:
+
         return None, 0
 
-    # Chroma creates the embeddings for us using a built-in model.
-    collection.add(ids=ids, documents=docs, metadatas=metas)
-    return collection, len(docs)
-
-
-# ---------- Step 3 + 4: retrieve and answer ----------
-def answer_question(question, collection):
-    results = collection.query(query_texts=[question], n_results=TOP_K)
-    chunks = results["documents"][0]
-    pages = [m["page"] for m in results["metadatas"][0]]
-
-    context = "\n\n".join(
-        f"[Page {p}]\n{c}" for p, c in zip(pages, chunks)
+    collection.add(
+        ids=ids,
+        documents=documents,
+        metadatas=metadata
     )
 
-    system_prompt = (
-        "You answer questions using ONLY the document excerpts provided. "
-        "If the answer is not in the excerpts, say you couldn't find it in the "
-        "document. Mention the page number(s) your answer comes from."
-    )
-    user_prompt = f"Excerpts:\n{context}\n\nQuestion: {question}"
-
-    client = genai.Client()  # reads GEMINI_API_KEY from your environment
-    text = call_gemini(client, system_prompt, user_prompt)
-    return text, sorted(set(pages)), chunks
+    return collection, len(documents)
 
 
-def call_gemini(client, system_prompt, user_prompt):
-    """Call Gemini, retrying on temporary errors and falling back to other models."""
+# =====================================================
+# 6. GEMINI API CALL
+# =====================================================
+
+def call_gemini(
+    client,
+    system_prompt,
+    user_prompt
+):
+
     last_error = None
+
     for model in [MODEL] + FALLBACK_MODELS:
+
         for attempt in range(3):
+
             try:
+
                 response = client.models.generate_content(
+
                     model=model,
+
                     contents=user_prompt,
+
                     config=types.GenerateContentConfig(
+
                         system_instruction=system_prompt,
-                        max_output_tokens=800,
-                    ),
+
+                        max_output_tokens=1000
+
+                    )
+
                 )
+
                 return response.text
-            except errors.ServerError as e:      # 500/503: Google is busy, wait and retry
-                last_error = e
-                time.sleep(2 ** (attempt + 1))   # waits 2s, 4s, 8s
-            except errors.ClientError as e:
-                if e.code in (404, 429):         # model missing or quota hit: try next model
-                    last_error = e
+
+            except errors.ServerError as error:
+
+                last_error = error
+
+                time.sleep(2 ** (attempt + 1))
+
+            except errors.ClientError as error:
+
+                last_error = error
+
+                # Try another model if unavailable or quota exceeded
+                if error.code in (404, 429):
+
                     break
-                raise                            # anything else (bad key, etc.) is a real bug
+
+                raise
+
     raise last_error
 
 
-# ---------- The web interface ----------
-st.set_page_config(page_title="Chat with your PDF", page_icon="📄")
-st.title("📄 Chat with your PDF")
+# =====================================================
+# 7. QUESTION ANSWERING
+# =====================================================
 
-uploaded = st.file_uploader("Upload a PDF", type="pdf")
+def answer_question(question, collection):
 
-if uploaded:
-    # Only rebuild the index when a new file is uploaded.
-    if st.session_state.get("file_name") != uploaded.name:
-        with st.spinner("Reading and indexing your document..."):
-            collection, n_chunks = build_index(uploaded)
-        if collection is None:
-            st.error("No readable text found. Scanned PDFs need OCR first.")
-            st.stop()
-        st.session_state.collection = collection
-        st.session_state.file_name = uploaded.name
-        st.session_state.n_chunks = n_chunks
+    results = collection.query(
 
-    st.success(f"Indexed {st.session_state.n_chunks} chunks from {uploaded.name}")
+        query_texts=[question],
 
-    question = st.text_input("Ask a question about the document")
+        n_results=min(
+            TOP_K,
+            collection.count()
+        )
+
+    )
+
+    chunks = results["documents"][0]
+
+    metadata = results["metadatas"][0]
+
+    pages = [
+        item["page"]
+        for item in metadata
+    ]
+
+    context = "\n\n".join(
+
+        f"[Page {page}]\n{chunk}"
+
+        for page, chunk in zip(pages, chunks)
+
+    )
+
+    system_prompt = """
+
+    You are DocuChat, an intelligent PDF assistant.
+
+    Answer questions using ONLY the provided document context.
+
+    Rules:
+
+    1. Do not invent information.
+    2. If information is unavailable, say so.
+    3. Explain answers clearly.
+    4. Mention the relevant PDF page numbers.
+    5. Keep answers understandable for beginners.
+
+    """
+
+    user_prompt = f"""
+
+    DOCUMENT CONTEXT:
+
+    {context}
+
+    USER QUESTION:
+
+    {question}
+
+    Provide an accurate answer with page references.
+
+    """
+
+    client = get_gemini_client()
+
+    answer = call_gemini(
+
+        client,
+
+        system_prompt,
+
+        user_prompt
+
+    )
+
+    return answer, sorted(set(pages)), chunks
+
+
+# =====================================================
+# 8. APPLICATION INTERFACE
+# =====================================================
+
+st.title("📄 DocuChat")
+
+st.subheader(
+    "AI-powered PDF Question Answering Assistant"
+)
+
+st.write(
+    "Upload a PDF and ask questions. "
+    "DocuChat retrieves relevant information "
+    "and generates answers with page references."
+)
+
+st.divider()
+
+
+# =====================================================
+# 9. API KEY CHECK
+# =====================================================
+
+try:
+
+    get_api_key()
+
+except ValueError as error:
+
+    st.error(str(error))
+
+    st.info(
+        "Configure your Gemini API key in "
+        "Streamlit Cloud Secrets or your local environment."
+    )
+
+    st.stop()
+
+
+# =====================================================
+# 10. PDF UPLOAD
+# =====================================================
+
+uploaded_file = st.file_uploader(
+
+    "📁 Upload your PDF document",
+
+    type=["pdf"]
+
+)
+
+
+if uploaded_file:
+
+    file_id = (
+        uploaded_file.name,
+        uploaded_file.size
+    )
+
+    if st.session_state.get("file_id") != file_id:
+
+        with st.spinner(
+            "Reading and indexing your PDF..."
+        ):
+
+            try:
+
+                collection, number_of_chunks = build_index(
+                    uploaded_file
+                )
+
+                if collection is None:
+
+                    st.error(
+                        "No readable text found. "
+                        "Scanned PDFs may require OCR."
+                    )
+
+                    st.stop()
+
+                st.session_state.collection = collection
+
+                st.session_state.file_id = file_id
+
+                st.session_state.number_of_chunks = (
+                    number_of_chunks
+                )
+
+                st.session_state.chat_history = []
+
+            except Exception as error:
+
+                st.error(
+                    f"PDF processing failed: {error}"
+                )
+
+                st.stop()
+
+    st.success(
+
+        f"Successfully indexed "
+        f"{st.session_state.number_of_chunks} "
+        f"chunks from {uploaded_file.name}"
+
+    )
+
+    st.divider()
+
+
+    # =================================================
+    # 11. CHAT INTERFACE
+    # =================================================
+
+    st.subheader("💬 Ask questions about your PDF")
+
+    for message in st.session_state.get(
+        "chat_history",
+        []
+    ):
+
+        with st.chat_message(message["role"]):
+
+            st.markdown(message["content"])
+
+
+    question = st.chat_input(
+        "Ask something about your document..."
+    )
+
+
     if question:
-        try:
-            with st.spinner("Thinking..."):
-                reply, pages, chunks = answer_question(question, st.session_state.collection)
-        except (errors.ServerError, errors.ClientError) as e:
-            st.error(
-                "Gemini couldn't answer right now (it may be busy or over the free "
-                f"limit). Wait a minute and ask again.\n\nDetails: {e}"
-            )
-            st.stop()
-        st.markdown(reply)
-        st.caption(f"Sources: pages {', '.join(map(str, pages))}")
-        with st.expander("See the text the AI was given"):
-            for c in chunks:
-                st.text(c)
-                st.divider()
+
+        st.session_state.chat_history.append({
+
+            "role": "user",
+
+            "content": question
+
+        })
+
+        with st.chat_message("user"):
+
+            st.markdown(question)
+
+
+        with st.chat_message("assistant"):
+
+            with st.spinner("Analyzing your document..."):
+
+                try:
+
+                    answer, pages, chunks = answer_question(
+
+                        question,
+
+                        st.session_state.collection
+
+                    )
+
+                    st.markdown(answer)
+
+                    st.caption(
+
+                        "Sources: Pages "
+                        + ", ".join(map(str, pages))
+
+                    )
+
+                    with st.expander(
+                        "View retrieved document excerpts"
+                    ):
+
+                        for chunk in chunks:
+
+                            st.write(chunk)
+
+                            st.divider()
+
+
+                    st.session_state.chat_history.append({
+
+                        "role": "assistant",
+
+                        "content": answer
+
+                    })
+
+
+                except Exception as error:
+
+                    st.error(
+                        f"Unable to generate answer: {error}"
+                    )
+
+
 else:
-    st.info("Upload a PDF to get started.")
+
+    st.info(
+        "👆 Upload a PDF to begin chatting with your document."
+    )
+
+
+# =====================================================
+# 12. SIDEBAR
+# =====================================================
+
+with st.sidebar:
+
+    st.title("DocuChat")
+
+    st.write(
+        "Your personal AI document assistant."
+    )
+
+    st.divider()
+
+    st.markdown("### Features")
+
+    st.write("📄 PDF text extraction")
+
+    st.write("🧠 Semantic search")
+
+    st.write("🔍 Vector database")
+
+    st.write("🤖 Gemini AI integration")
+
+    st.write("📚 Page-based citations")
+
+    st.divider()
+
+    if st.button("Clear chat history"):
+
+        st.session_state.chat_history = []
+
+        st.rerun()
+
+    st.caption(
+        "Powered by Python, Streamlit, ChromaDB and Gemini."
+    )
